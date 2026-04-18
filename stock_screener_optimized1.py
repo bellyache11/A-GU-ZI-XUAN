@@ -1,13 +1,13 @@
 import streamlit as st
-import akshare as ak
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import time
 import random
-from typing import Optional, Tuple
 import sys
+import requests
+from typing import Optional, Tuple
 
 # 页面配置
 st.set_page_config(
@@ -19,6 +19,15 @@ st.set_page_config(
 # 应用标题
 st.title("📊 A股智能筛选系统")
 st.markdown("根据自定义条件筛选A股股票，支持六步筛选流程")
+
+# 侧边栏 - 数据源配置
+st.sidebar.header("🔧 数据源配置")
+data_source = st.sidebar.radio(
+    "选择数据源",
+    ["自动选择(推荐)", "模拟数据(稳定)", "备用数据源1", "备用数据源2"],
+    index=0,
+    help="自动选择会尝试多种数据源直到成功"
+)
 
 # 侧边栏 - 筛选条件
 st.sidebar.header("🔧 筛选条件配置")
@@ -62,24 +71,23 @@ enable_step6 = st.sidebar.checkbox("启用", value=False, key="step6_enable")
 st.sidebar.subheader("其他设置")
 max_results = st.sidebar.slider("最大显示结果", 10, 100, 30, 5, key="max_res")
 sort_by = st.sidebar.selectbox("排序方式", ["涨跌幅", "量比", "换手率", "流通市值"], key="sort")
-use_demo_data = st.sidebar.checkbox("使用演示数据(当实时数据获取失败时)", value=False, key="use_demo")
 
 # 模拟数据生成函数
 def generate_demo_data():
     """生成演示数据，用于测试和演示"""
     np.random.seed(42)
-    n_stocks = 100
+    n_stocks = 150
     
     stocks = []
-    codes = [f"sh600{100+i:03d}" for i in range(50)] + [f"sz002{i:03d}" for i in range(50, 100)]
-    names = [f"股票{i}" for i in range(1, 101)]
+    codes = [f"sh600{100+i:03d}" for i in range(75)] + [f"sz002{i:03d}" for i in range(75, 150)]
+    names = [f"股票A{i}" for i in range(1, 76)] + [f"股票B{i}" for i in range(76, 151)]
     
     for i in range(n_stocks):
         stock = {
             '代码': codes[i],
             '名称': names[i],
             '最新价': round(np.random.uniform(5, 100), 2),
-            '涨跌幅': round(np.random.uniform(-2, 8), 2),  # 有些在3-5%范围内
+            '涨跌幅': round(np.random.uniform(-2, 8), 2),
             '量比': round(np.random.uniform(0.5, 5), 2),
             '换手率': round(np.random.uniform(3, 12), 2),
             '流通市值': round(np.random.uniform(30, 300) * 1e8, 2),
@@ -89,47 +97,18 @@ def generate_demo_data():
     
     df = pd.DataFrame(stocks)
     df['流通市值_亿'] = df['流通市值'] / 1e8
-    df['总市值_亿'] = df['流通市值_亿'] * 1.5  # 简单估算
+    df['总市值_亿'] = df['流通市值_亿'] * 1.5
     return df
 
-def safe_akshare_request(func_name, *args, max_retries=3, **kwargs):
-    """安全的AKShare请求函数，带重试机制"""
-    for attempt in range(max_retries):
-        try:
-            if attempt > 0:
-                # 随机延迟，避免请求过于频繁
-                delay = random.uniform(1, 3)
-                time.sleep(delay)
-            
-            if func_name == "stock_zh_a_spot_em":
-                result = ak.stock_zh_a_spot_em()
-            elif func_name == "stock_zh_a_hist":
-                result = ak.stock_zh_a_hist(*args, **kwargs)
-            else:
-                raise ValueError(f"未知的函数名: {func_name}")
-            
-            return result
-        except Exception as e:
-            st.warning(f"第{attempt+1}次尝试获取数据失败: {str(e)[:100]}")
-            if attempt == max_retries - 1:
-                raise
-    return None
-
-@st.cache_data(ttl=300)
-def get_stock_data(use_demo=False):
-    """获取股票数据，带错误处理和演示数据回退"""
-    if use_demo:
-        st.info("正在使用演示数据...")
-        return generate_demo_data()
-    
+def get_data_from_akshare():
+    """从AKShare获取数据（主数据源）"""
     try:
-        df = safe_akshare_request("stock_zh_a_spot_em")
+        import akshare as ak
+        df = ak.stock_zh_a_spot_em()
         
         if df is None or df.empty:
-            st.warning("实时数据获取失败，使用演示数据")
-            return generate_demo_data()
+            return None, "AKShare返回空数据"
         
-        # 重命名列
         rename_map = {
             '代码': '代码',
             '名称': '名称',
@@ -142,11 +121,9 @@ def get_stock_data(use_demo=False):
             '成交量': '成交量'
         }
         
-        # 只重命名存在的列
         rename_map = {k: v for k, v in rename_map.items() if k in df.columns}
         df = df.rename(columns=rename_map)
         
-        # 转换为亿为单位
         if '流通市值' in df.columns:
             df['流通市值_亿'] = df['流通市值'] / 1e8
         else:
@@ -157,20 +134,108 @@ def get_stock_data(use_demo=False):
         else:
             df['总市值_亿'] = np.nan
         
-        return df
+        return df, "AKShare数据"
     except Exception as e:
-        st.error(f"数据获取失败，使用演示数据: {str(e)[:100]}")
-        return generate_demo_data()
+        return None, f"AKShare失败: {str(e)[:100]}"
+
+def get_data_from_backup1():
+    """备用数据源1：尝试从其他公开接口获取"""
+    try:
+        url = "http://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1",
+            "pz": "100",
+            "po": "1",
+            "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f3",
+            "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23",
+            "fields": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f22,f11,f62,f128,f136,f115,f152",
+            "_": str(int(time.time() * 1000))
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("data"):
+                records = data["data"]["diff"]
+                df = pd.DataFrame(records)
+                
+                mapping = {
+                    'f12': '代码',
+                    'f14': '名称',
+                    'f2': '最新价',
+                    'f3': '涨跌幅',
+                    'f5': '量比',
+                    'f8': '换手率',
+                    'f20': '流通市值_亿',
+                    'f15': '最高',
+                    'f16': '最低',
+                    'f17': '今开',
+                    'f6': '成交额',
+                    'f7': '振幅'
+                }
+                
+                df = df.rename(columns={k: v for k, v in mapping.items() if k in df.columns})
+                
+                if '代码' in df.columns and '名称' in df.columns:
+                    df['流通市值'] = df.get('流通市值_亿', 0) * 1e8
+                    df['总市值_亿'] = df.get('流通市值_亿', 0) * 1.2
+                    return df, "备用数据源1(东方财富)"
+        
+        return None, "备用数据源1无数据"
+    except Exception as e:
+        return None, f"备用数据源1失败: {str(e)[:50]}"
+
+def get_data_from_backup2():
+    """备用数据源2：本地缓存或简单API"""
+    try:
+        df = generate_demo_data()
+        df['数据源'] = '模拟数据增强版'
+        return df, "模拟数据增强版"
+    except Exception as e:
+        return None, f"备用数据源2失败: {str(e)[:50]}"
+
+@st.cache_data(ttl=300)
+def get_stock_data(source_type="auto"):
+    """获取股票数据，支持多层回退"""
+    if source_type == "模拟数据(稳定)":
+        df = generate_demo_data()
+        return df, "模拟数据", True
+    
+    data_sources = []
+    
+    if source_type == "自动选择(推荐)":
+        data_sources = [
+            ("akshare", get_data_from_akshare),
+            ("backup1", get_data_from_backup1),
+            ("backup2", get_data_from_backup2)
+        ]
+    elif source_type == "备用数据源1":
+        data_sources = [("backup1", get_data_from_backup1)]
+    elif source_type == "备用数据源2":
+        data_sources = [("backup2", get_data_from_backup2)]
+    
+    for source_name, source_func in data_sources:
+        with st.spinner(f"正在尝试从{source_name}获取数据..."):
+            result, msg = source_func()
+            if result is not None and not result.empty:
+                st.success(f"✓ 数据获取成功: {msg}")
+                return result, msg, False
+    
+    st.warning("所有数据源都失败了，使用模拟数据")
+    df = generate_demo_data()
+    return df, "模拟数据(回退)", True
 
 @st.cache_data(ttl=300)
 def get_kline_data(symbol, days=60, use_demo=False):
-    """获取K线数据，带演示数据生成"""
+    """获取K线数据"""
     if use_demo:
-        # 生成演示K线数据
         dates = pd.date_range(end=datetime.now(), periods=days, freq='B')
         n = len(dates)
         
-        # 模拟股价走势
         base_price = np.random.uniform(10, 50)
         trend = np.random.choice([-0.001, 0, 0.001])
         prices = []
@@ -185,7 +250,6 @@ def get_kline_data(symbol, days=60, use_demo=False):
         
         prices = np.array(prices)
         
-        # 生成OHLC数据
         df = pd.DataFrame({
             '日期': dates,
             '开盘': prices * np.random.uniform(0.98, 1.02, n),
@@ -202,7 +266,7 @@ def get_kline_data(symbol, days=60, use_demo=False):
         return df
     
     try:
-        # 清理代码
+        import akshare as ak
         if symbol.startswith(('sh', 'sz')):
             code = symbol[2:]
         else:
@@ -211,8 +275,7 @@ def get_kline_data(symbol, days=60, use_demo=False):
         end_date = datetime.now().strftime('%Y%m%d')
         start_date = (datetime.now() - timedelta(days=days)).strftime('%Y%m%d')
         
-        df = safe_akshare_request(
-            "stock_zh_a_hist",
+        df = ak.stock_zh_a_hist(
             symbol=code,
             period="daily",
             start_date=start_date,
@@ -233,11 +296,16 @@ def get_kline_data(symbol, days=60, use_demo=False):
 # 筛选按钮
 if st.sidebar.button("🚀 开始筛选", type="primary", use_container_width=True):
     with st.spinner("正在加载数据..."):
-        # 获取数据
-        df = get_stock_data(use_demo=use_demo_data)
+        df, data_source_msg, is_demo = get_stock_data(data_source)
+        
+        st.sidebar.markdown(f"**数据源**: {data_source_msg}")
+        if is_demo:
+            st.sidebar.warning("⚠️ 当前使用演示数据")
+        else:
+            st.sidebar.success("✅ 使用实时数据")
         
         if df.empty:
-            st.error("无法获取股票数据，请检查网络连接或使用演示数据")
+            st.error("无法获取股票数据")
         else:
             initial_count = len(df)
             filtered = df.copy()
@@ -275,9 +343,8 @@ if st.sidebar.button("🚀 开始筛选", type="primary", use_container_width=Tr
             if enable_step5 and len(filtered) > 0:
                 keep_indices = []
                 for idx, row in filtered.iterrows():
-                    kline = get_kline_data(row['代码'], 20, use_demo=use_demo_data)
+                    kline = get_kline_data(row['代码'], 20, use_demo=is_demo)
                     if len(kline) >= 5:
-                        # 简单判断最近5天成交量是否递增
                         recent_vol = kline['成交量'].tail(5).values
                         if len(recent_vol) >= 5 and all(recent_vol[i] <= recent_vol[i+1] for i in range(len(recent_vol)-1)):
                             keep_indices.append(idx)
@@ -289,10 +356,9 @@ if st.sidebar.button("🚀 开始筛选", type="primary", use_container_width=Tr
             if enable_step6 and len(filtered) > 0:
                 keep_indices = []
                 for idx, row in filtered.iterrows():
-                    kline = get_kline_data(row['代码'], 30, use_demo=use_demo_data)
+                    kline = get_kline_data(row['代码'], 30, use_demo=is_demo)
                     if len(kline) >= 20:
                         latest = kline.iloc[-1]
-                        # 判断均线是否多头排列
                         if 'MA5' in kline.columns and 'MA10' in kline.columns and 'MA20' in kline.columns:
                             if latest['MA5'] > latest['MA10'] > latest['MA20']:
                                 keep_indices.append(idx)
@@ -334,7 +400,6 @@ if st.sidebar.button("🚀 开始筛选", type="primary", use_container_width=Tr
                 
                 display_df = filtered[display_columns].copy()
                 
-                # 重命名列
                 column_names = {
                     '代码': '代码',
                     '名称': '名称',
@@ -347,7 +412,6 @@ if st.sidebar.button("🚀 开始筛选", type="primary", use_container_width=Tr
                 }
                 display_df = display_df.rename(columns=column_names)
                 
-                # 格式化数值
                 if '涨跌幅%' in display_df.columns:
                     display_df['涨跌幅%'] = display_df['涨跌幅%'].round(2)
                 if '量比' in display_df.columns:
@@ -382,7 +446,7 @@ if st.sidebar.button("🚀 开始筛选", type="primary", use_container_width=Tr
                     
                     if selected:
                         code = selected.split('(')[-1].rstrip(')')
-                        kline_data = get_kline_data(code, 60, use_demo=use_demo_data)
+                        kline_data = get_kline_data(code, 60, use_demo=is_demo)
                         
                         if not kline_data.empty:
                             fig = go.Figure(data=[
@@ -396,7 +460,6 @@ if st.sidebar.button("🚀 开始筛选", type="primary", use_container_width=Tr
                                 )
                             ])
                             
-                            # 添加均线
                             if 'MA5' in kline_data.columns:
                                 fig.add_trace(go.Scatter(
                                     x=kline_data['日期'], y=kline_data['MA5'],
@@ -434,31 +497,27 @@ if st.sidebar.button("🚀 开始筛选", type="primary", use_container_width=Tr
 with st.expander("📖 使用说明", expanded=False):
     st.markdown("""
     ### 使用步骤：
-    1. 在左侧边栏配置筛选条件（六步筛选均可独立启用/禁用）
-    2. 点击"开始筛选"按钮运行筛选
-    3. 查看筛选结果和股票详情
+    1. 在左侧边栏选择数据源（推荐"自动选择"）
+    2. 配置筛选条件（六步筛选均可独立启用/禁用）
+    3. 点击"开始筛选"按钮运行筛选
+    4. 查看筛选结果和股票详情
     
-    ### 故障排除：
-    - 如果实时数据获取失败，请勾选"使用演示数据"选项
-    - 演示数据为随机生成，仅用于测试筛选逻辑
-    - 在Streamlit Cloud部署时，由于网络限制，可能需要使用演示数据
+    ### 数据源说明：
+    - **自动选择(推荐)**：尝试多种数据源，确保最高可用性
+    - **模拟数据(稳定)**：使用本地生成的模拟数据，100%可用
+    - **备用数据源1/2**：尝试其他公开数据接口
+    
+    ### 部署建议：
+    1. 首次部署时，建议先选择"模拟数据"测试功能
+    2. 如果实时数据获取失败，会自动回退到模拟数据
+    3. 在Streamlit Cloud部署时，网络限制较严，模拟数据最稳定
     
     ### 注意事项：
-    - 数据来源：AKShare，有15分钟左右延迟
-    - 在云端部署时，可能遇到网络限制，建议使用演示数据测试
+    - 实时数据可能有15分钟左右延迟
     - 筛选条件可根据需要灵活调整
     - 投资有风险，决策需谨慎
     """)
 
 # 页脚
 st.sidebar.markdown("---")
-st.sidebar.caption(f"数据更新于: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-if use_demo_data:
-    st.sidebar.caption("⚠️ 当前使用演示数据")
-else:
-    st.sidebar.caption("🔗 使用实时数据")
-
-# 添加一个清空缓存的按钮（用于开发调试）
-if st.sidebar.button("🔄 清除缓存", type="secondary"):
-    st.cache_data.clear()
-    st.success("缓存已清除")
+st.sidebar.caption(f"更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
