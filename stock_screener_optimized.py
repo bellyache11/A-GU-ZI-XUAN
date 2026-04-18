@@ -16,9 +16,7 @@ st.set_page_config(
 
 # 应用标题
 st.title("📈 A股智能筛选系统")
-st.markdown("""
-这是一个完整的A股股票筛选系统，支持多重筛选条件，确保在Streamlit Cloud上稳定运行。
-""")
+st.markdown("这是一个完整的A股股票筛选系统，支持多重筛选条件，确保在Streamlit Cloud上稳定运行。")
 
 # 侧边栏配置
 st.sidebar.header("⚙️ 系统配置")
@@ -462,8 +460,4 @@ if __name__ == "__main__":
         3. **点击"开始筛选"**运行筛选
         
         4. **查看结果**并下载CSV文件
-        
-        ### 部署到Streamlit Cloud：
-        1. 创建文件 `stock_screener_complete.py`
-        2. 创建 `requirements.txt` 文件：
-        
+        """)
