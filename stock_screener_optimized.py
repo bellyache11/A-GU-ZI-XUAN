@@ -431,7 +431,7 @@ def get_data_from_enhanced_simulation() -> Tuple[pd.DataFrame, str]:
             pct_change = np.clip(pct_change + np.random.normal(0, 0.5), -10, 10)
         
         stock = {
-            '代码': f"sh{600000 + i:06d}" if i < 250 else f"sz{000001 + i:06d}",
+            '代码': f"sh{600000 + i:06d}" if i < 250 else f"sz{1 + i:06d}",  # 已修正：将000001改为1
             '名称': f"股票{1000 + i:04d}",
             '最新价': round(np.random.uniform(3.0, 200.0), 2),
             '涨跌幅': round(pct_change, 2),
